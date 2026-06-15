@@ -1,252 +1,294 @@
 # =========================================================
-# IMPORT
+# API FASTAPI - MSSA-LSTM QoS PREDICTION
+# Input: batch List[List[float]] dari Flutter SQLite
 # =========================================================
+
+import traceback
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Optional
+
 from fastapi import FastAPI
-from pydantic import BaseModel
-import numpy as np
-import pandas as pd
-import tensorflow as tf
-from typing import List, Optional
-from scipy.linalg import svd
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, field_validator
 
 # =========================================================
-# INIT APP
+# KONSTANTA
 # =========================================================
-app = FastAPI()
-
-print("===================================")
-print("API SERVER STARTED")
-print("===================================")
+MIN_ROWS   = 111   # lookback=110, minimal 111 baris
+N_FEATURES = 4     # Throughput, Delay, Jitter, SINR
 
 # =========================================================
-# CONFIG
+# STATE
 # =========================================================
-LOOKBACK = 110
-HORIZON = 4
-MSSA_WINDOW = 50
-
-# simulasi weekly (misal 2 jam per hari × 7 hari × 3600 detik)
-MIN_WEEKLY_DATA = 7 * 2 * 60 * 60  # 50400 data
+_model_ready   = False
+_model_loading = False
 
 # =========================================================
-# REQUEST SCHEMA
+# BACKGROUND LOADING
 # =========================================================
-class QoSInput(BaseModel):
-    input: List[List[float]]
-    target: Optional[List[float]] = None
+async def _load_model_background():
+    global _model_ready, _model_loading
+    _model_loading = True
+    try:
+        print("[API] Loading model...")
+        from pipeline import warmup
+        await asyncio.to_thread(warmup)
+        _model_ready   = True
+        _model_loading = False
+        print("[API] Model siap")
+    except Exception as e:
+        _model_loading = False
+        print(f"[API] Gagal load model: {e}")
+        traceback.print_exc()
 
-class QoSEvalInput(BaseModel):
-    input: List[List[float]]
-    target: List[float]
+# =========================================================
+# LIFESPAN
+# =========================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(_load_model_background())
+    yield
 
 # =========================================================
-# LOAD MODEL
+# APP
 # =========================================================
-model = tf.keras.models.load_model(
-    "model_qos_tiphon1.keras",
-    compile=False
+app = FastAPI(
+    title="MSSA-LSTM QoS API",
+    lifespan=lifespan
 )
 
-print("MODEL INPUT SHAPE:", model.input_shape)
+# =========================================================
+# SCHEMA
+# =========================================================
+class QoSInput(BaseModel):
+    input: list[list[float]]
+
+    @field_validator("input")
+    @classmethod
+    def validate_input(cls, v):
+        if len(v) == 0:
+            raise ValueError("Input kosong")
+        for i, row in enumerate(v):
+            if len(row) != N_FEATURES:
+                raise ValueError(
+                    f"Baris ke-{i} harus {N_FEATURES} kolom "
+                    f"[Throughput, Delay, Jitter, SINR], "
+                    f"diterima {len(row)}"
+                )
+        return v
 
 # =========================================================
-# MSSA FUNCTION (HARUS SAMA DENGAN TRAINING)
+# HELPER
 # =========================================================
-def mssa_decompose(series, L=50):
-
-    N, n_features = series.shape
-    L = min(L, N // 3)
-    K = N - L + 1
-
-    X = np.zeros((L * n_features, K))
-
-    for i in range(K):
-        X[:, i] = series[i:i+L].T.flatten('F')
-
-    U, S, Vt = svd(X, full_matrices=False)
-
-    rank = len(S)
-    n_trend = max(1, rank // 4)
-    n_fluct = max(1, rank // 4)
-
-    trend_comp = U[:, :n_trend] @ np.diag(S[:n_trend]) @ Vt[:n_trend]
-
-    fluct_comp = (
-        U[:, n_trend:n_trend+n_fluct]
-        @ np.diag(S[n_trend:n_trend+n_fluct])
-        @ Vt[n_trend:n_trend+n_fluct]
-    )
-
-    def reconstruct(mat):
-        recon = np.zeros((N, n_features))
-
-        for f in range(n_features):
-            comp = mat[f*L:(f+1)*L]
-
-            for i in range(N):
-                vals = []
-                for j in range(max(0, i-L+1), min(i+1, K)):
-                    vals.append(comp[i-j, j])
-
-                recon[i, f] = np.mean(vals)
-
-        return recon
-
-    trend = reconstruct(trend_comp)
-    fluct = reconstruct(fluct_comp)
-
-    return trend + fluct
-
-# =========================================================
-# PREPROCESS
-# =========================================================
-def preprocess(raw):
-    raw = pd.DataFrame(raw)
-    raw = raw.replace([np.inf, -np.inf], np.nan)
-    raw = raw.interpolate(method='linear', limit_direction='both')
-    raw = raw.fillna(raw.median())
-    return raw.values
-
-# =========================================================
-# PREDICT (WEEKLY FORECASTING)
-# =========================================================
-@app.post("/predict")
-def predict(data: QoSInput):
-
-    try:
-        print("\n====================================")
-        print("WEEKLY PREDICTION REQUEST")
-        print("====================================")
-
-        raw = np.array(data.input, dtype=float)
-
-        # VALIDASI
-        if len(raw.shape) != 2 or raw.shape[1] != 4:
-            return {"status": "error", "message": "Input harus (n,4)"}
-
-        # WEEKLY CHECK
-        if len(raw) < LOOKBACK:
-            return {
-                "status": "error",
-                "message": "Data tidak cukup untuk forecasting"
+def _check_model() -> Optional[JSONResponse]:
+    if not _model_ready:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status"       : "loading",
+                "message"      : "Model masih loading, coba beberapa saat lagi",
+                "model_ready"  : _model_ready,
+                "model_loading": _model_loading,
             }
-
-        # CLEANING
-        raw = preprocess(raw)
-
-        # MSSA
-        reconstructed = mssa_decompose(raw, L=MSSA_WINDOW)
-
-        # AMBIL WINDOW TERAKHIR (representasi histori)
-        window = reconstructed[-LOOKBACK:]
-        window = np.expand_dims(window, axis=0)
-
-        # PREDIKSI MULTI-STEP
-        pred = model(window, training=False).numpy().flatten()
-
-        result = {
-            "status": "success",
-            "predictions": {
-                "30_min": float(pred[0]),
-                "60_min": float(pred[1]),
-                "90_min": float(pred[2]),
-                "120_min": float(pred[3])
-            }
-        }
-
-        # OPTIONAL EVALUASI
-        if data.target is not None:
-
-            y_true = np.array(data.target, dtype=float)
-
-            if len(y_true) == HORIZON:
-                rmse = float(np.sqrt(np.mean((y_true - pred) ** 2)))
-                mae  = float(np.mean(np.abs(y_true - pred)))
-
-                result["evaluation"] = {
-                    "rmse": rmse,
-                    "mae": mae
-                }
-            else:
-                result["warning"] = "Target harus 4 nilai (multi-step)"
-
-        return result
-
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# =========================================================
-# EVALUATE (BATCH WEEKLY)
-# =========================================================
-@app.post("/evaluate")
-def evaluate(data: QoSEvalInput):
-
-    try:
-        raw = np.array(data.input, dtype=float)
-        y_true = np.array(data.target, dtype=float)
-
-        if len(raw.shape) != 2 or raw.shape[1] != 4:
-            return {"status": "error", "message": "Input harus (n,4)"}
-
-        raw = preprocess(raw)
-        reconstructed = mssa_decompose(raw, L=MSSA_WINDOW)
-
-        X, y = [], []
-
-        for i in range(len(reconstructed) - LOOKBACK - HORIZON):
-            X.append(reconstructed[i:i+LOOKBACK])
-            y.append(y_true[i+LOOKBACK:i+LOOKBACK+HORIZON])
-
-        X = np.array(X)
-        y = np.array(y)
-
-        pred = model.predict(X)
-
-        rmse = float(np.sqrt(np.mean((y - pred) ** 2)))
-        mae  = float(np.mean(np.abs(y - pred))
-
         )
+    return None
 
-        # PER HORIZON
-        detail = {}
-        for i in range(HORIZON):
-            rmse_h = float(np.sqrt(np.mean((y[:, i] - pred[:, i]) ** 2)))
-            mae_h  = float(np.mean(np.abs(y[:, i] - pred[:, i])))
-
-            detail[f"horizon_{i+1}"] = {
-                "rmse": rmse_h,
-                "mae": mae_h
+def _check_min_rows(n: int) -> Optional[JSONResponse]:
+    if n < MIN_ROWS:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status" : "waiting",
+                "message": f"Data belum cukup: {n}/{MIN_ROWS} baris",
             }
-
-        return {
-            "status": "success",
-            "overall": {
-                "rmse": rmse,
-                "mae": mae
-            },
-            "per_horizon": detail,
-            "samples": len(y)
-        }
-
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+        )
+    return None
 
 # =========================================================
-# ROOT
+# ROOT & STATUS
 # =========================================================
 @app.get("/")
-def root():
-    return {"message": "QoS Weekly Forecasting API Running"}
+async def root():
+    return {
+        "status"       : "online",
+        "model"        : "MSSA-LSTM",
+        "model_ready"  : _model_ready,
+        "model_loading": _model_loading,
+    }
+
+@app.get("/status")
+async def status():
+    return {
+        "status"       : "online",
+        "model_ready"  : _model_ready,
+        "model_loading": _model_loading,
+    }
 
 # =========================================================
-# RUN
+# /predict — 1 prediksi dari window terakhir
+# =========================================================
+@app.post("/predict")
+async def predict(data: QoSInput):
+
+    err = _check_model()
+    if err: return err
+
+    err = _check_min_rows(len(data.input))
+    if err: return err
+
+    try:
+        from pipeline import predict_current
+
+        result = await asyncio.to_thread(
+            predict_current,
+            data.input
+        )
+
+        pred = result["current_prediction"]
+
+        return {
+            "status": "completed",
+            "model" : "MSSA-LSTM",
+            "result": {
+                "final_prediction": pred["qos_index"],
+                "series"          : [pred["qos_index"]],
+                "forecast_time"   : "t+1",
+                "model"           : "MSSA-LSTM",
+                "detail"          : {
+                    "Throughput (Mbps)": pred["Throughput (Mbps)"],
+                    "Delay (ms)"       : pred["Delay (ms)"],
+                    "Jitter (ms)"      : pred["Jitter (ms)"],
+                    "SINR (dB)"        : pred["SINR (dB)"],
+                    "qos_index"        : pred["qos_index"],
+                }
+            }
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e),
+                     "trace": traceback.format_exc()}
+        )
+
+# =========================================================
+# /predict_sliding — semua titik prediksi sliding window
+# =========================================================
+@app.post("/predict_sliding")
+async def predict_sliding(data: QoSInput):
+
+    err = _check_model()
+    if err: return err
+
+    err = _check_min_rows(len(data.input))
+    if err: return err
+
+    try:
+        from pipeline import predict_sliding as run_sliding
+
+        result = await asyncio.to_thread(
+            run_sliding,
+            data.input
+        )
+
+        return {
+            "status"      : "success",
+            "model"       : "MSSA-LSTM",
+            "total_points": result["total_points"],
+            "predictions" : [
+                p["qos_index"] for p in result["predictions"]
+            ],
+            "predictions_detail": result["predictions"],
+        }
+
+    except ValueError as e:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error", "message": str(e)}
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e),
+                     "trace": traceback.format_exc()}
+        )
+
+# =========================================================
+# /predict_future — replika otomatis ke depan
+#
+# PERUBAHAN DARI VERSI LAMA:
+#   - target_steps TIDAK lagi hardcode = 8
+#   - Dihitung otomatis di pipeline dari jumlah data
+#   - Flutter TIDAK perlu kirim target_steps
+#   - Makin banyak data → makin banyak prediksi yang dihasilkan
+#
+# Rumus step:
+#   extra_detik  = (N - lookback) * 1 detik/baris
+#   target_steps = extra_detik // 1800
+#   (minimal 1 step)
+#
+# Contoh:
+#   N = 1910 baris → 1 prediksi  (t+30m)
+#   N = 3710 baris → 2 prediksi  (t+30m, t+60m)
+#   N = 5510 baris → 3 prediksi  (dst.)
+#
+# Response Flutter parse:
+#   decoded['status'] == 'success'
+#   decoded['predictions']  → List<double> qos_index
+#   decoded['total_steps']  → berapa step yang dihasilkan (dinamis)
+# =========================================================
+@app.post("/predict_future")
+async def predict_future(data: QoSInput):
+
+    err = _check_model()
+    if err: return err
+
+    err = _check_min_rows(len(data.input))
+    if err: return err
+
+    try:
+        from pipeline import predict_future as run_future
+
+        # Tidak ada target_steps — pipeline hitung otomatis
+        result = await asyncio.to_thread(
+            run_future,
+            data.input,
+        )
+
+        return {
+            "status"            : "success",
+            "model"             : "MSSA-LSTM",
+            "total_steps"       : result["target_steps"],      # dinamis!
+            "interval_seconds"  : 1800,
+            "forecast_times"    : result["forecast_times"],
+            "predictions"       : [
+                p["qos_index"] for p in result["future_predictions"]
+            ],
+            "final_prediction"  : result["final_prediction"],
+            "predictions_detail": result["future_predictions"],
+        }
+
+    except ValueError as e:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error", "message": str(e)}
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e),
+                     "trace": traceback.format_exc()}
+        )
+
+# =========================================================
+# MAIN
 # =========================================================
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(
         "api:app",
-        host="192.168.1.14",
+        host="0.0.0.0",
         port=8000,
-        reload=True
+        reload=False,
     )

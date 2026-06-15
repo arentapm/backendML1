@@ -1,5 +1,11 @@
 numpy
 joblib
-svd
 scikit-learn
 pandas
+tensorflow
+scipy
+python-multipart
+fastapi
+uvicorn
+matplotlib
+pydantic

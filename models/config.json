@@ -1,0 +1,19 @@
+{
+    "lookback": 110,
+    "L_MSSA": 50,
+    "features": [
+        "Throughput (Mbps)",
+        "Delay (ms)",
+        "Jitter (ms)",
+        "SINR (dB)"
+    ],
+    "n_features": 4,
+    "model_type": "MSSA-LSTM",
+    "mssa_components": {
+        "trend": "digunakan",
+        "fluctuation": "digunakan",
+        "noise": "dibuang \u2014 tidak masuk model"
+    },
+    "scaler": "MinMaxScaler [0,1]",
+    "output_target": "4 fitur \u2192 QoS Index dihitung post-hoc"
+}
