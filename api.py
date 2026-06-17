@@ -59,7 +59,7 @@ app = FastAPI(
     title="MSSA-LSTM QoS API",
     description=(
         "Recursive Sliding Window Forecasting berbasis "
-        "arXiv:2511.11630 — setiap prediksi menjadi input "
+        "setiap prediksi menjadi input "
         "window berikutnya (replika otomatis)."
     ),
     lifespan=lifespan,
