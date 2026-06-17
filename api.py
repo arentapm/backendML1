@@ -1,6 +1,7 @@
 # =========================================================
 # API FASTAPI - MSSA-LSTM QoS PREDICTION
 # Input: batch List[List[float]] dari Flutter SQLite
+# Referensi: Recursive Sliding Window (arXiv:2511.11630)
 # =========================================================
 
 import traceback
@@ -15,7 +16,8 @@ from pydantic import BaseModel, field_validator
 # =========================================================
 # KONSTANTA
 # =========================================================
-MIN_ROWS   = 111   # lookback=110, minimal 111 baris
+MIN_ROWS   = 110   # = lookback (tidak perlu +1 karena predict_future
+                   #   tidak butuh data SETELAH window, window IS-nya data)
 N_FEATURES = 4     # Throughput, Delay, Jitter, SINR
 
 # =========================================================
@@ -55,7 +57,12 @@ async def lifespan(app: FastAPI):
 # =========================================================
 app = FastAPI(
     title="MSSA-LSTM QoS API",
-    lifespan=lifespan
+    description=(
+        "Recursive Sliding Window Forecasting berbasis "
+        "arXiv:2511.11630 — setiap prediksi menjadi input "
+        "window berikutnya (replika otomatis)."
+    ),
+    lifespan=lifespan,
 )
 
 # =========================================================
@@ -126,7 +133,11 @@ async def status():
     }
 
 # =========================================================
-# /predict — 1 prediksi dari window terakhir
+# /predict — 1 prediksi dari window terakhir (real-time)
+#
+# Dipakai untuk monitoring langsung:
+#   - Ambil N baris terakhir dari buffer SQLite
+#   - Prediksi 1 step ke depan tanpa rekursi
 # =========================================================
 @app.post("/predict")
 async def predict(data: QoSInput):
@@ -142,101 +153,65 @@ async def predict(data: QoSInput):
 
         result = await asyncio.to_thread(
             predict_current,
-            data.input
+            data.input,
         )
 
         pred = result["current_prediction"]
 
         return {
-            "status": "completed",
+            "status": "success",
             "model" : "MSSA-LSTM",
             "result": {
-                "final_prediction": pred["qos_index"],
-                "series"          : [pred["qos_index"]],
-                "forecast_time"   : "t+1",
-                "model"           : "MSSA-LSTM",
-                "detail"          : {
+                "final_prediction" : pred["qos_index"],
+                "series"           : [pred["qos_index"]],
+                "forecast_time"    : "t+1",
+                "model"            : "MSSA-LSTM",
+                "detail"           : {
                     "Throughput (Mbps)": pred["Throughput (Mbps)"],
                     "Delay (ms)"       : pred["Delay (ms)"],
                     "Jitter (ms)"      : pred["Jitter (ms)"],
                     "SINR (dB)"        : pred["SINR (dB)"],
                     "qos_index"        : pred["qos_index"],
-                }
+                },
+            },
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status" : "error",
+                "message": str(e),
+                "trace"  : traceback.format_exc(),
             }
-        }
-
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e),
-                     "trace": traceback.format_exc()}
         )
 
 # =========================================================
-# /predict_sliding — semua titik prediksi sliding window
-# =========================================================
-@app.post("/predict_sliding")
-async def predict_sliding(data: QoSInput):
-
-    err = _check_model()
-    if err: return err
-
-    err = _check_min_rows(len(data.input))
-    if err: return err
-
-    try:
-        from pipeline import predict_sliding as run_sliding
-
-        result = await asyncio.to_thread(
-            run_sliding,
-            data.input
-        )
-
-        return {
-            "status"      : "success",
-            "model"       : "MSSA-LSTM",
-            "total_points": result["total_points"],
-            "predictions" : [
-                p["qos_index"] for p in result["predictions"]
-            ],
-            "predictions_detail": result["predictions"],
-        }
-
-    except ValueError as e:
-        return JSONResponse(
-            status_code=422,
-            content={"status": "error", "message": str(e)}
-        )
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e),
-                     "trace": traceback.format_exc()}
-        )
-
-# =========================================================
-# /predict_future — replika otomatis ke depan
+# /predict_future — Recursive Sliding Window (arXiv:2511.11630)
 #
-# PERUBAHAN DARI VERSI LAMA:
-#   - target_steps TIDAK lagi hardcode = 8
-#   - Dihitung otomatis di pipeline dari jumlah data
-#   - Flutter TIDAK perlu kirim target_steps
-#   - Makin banyak data → makin banyak prediksi yang dihasilkan
+# MEKANISME (identik Gambar 2 jurnal):
+#   Step 1 : window = [t1, t2, …, t110]           → P1
+#   Step 2 : window = [t2, t3, …, t110, P1]       → P2
+#   Step 3 : window = [t3, t4, …, t110, P1, P2]   → P3
+#   …
+#   Baris tertua dibuang, prediksi terbaru (replika) masuk di ekor.
 #
-# Rumus step:
+# JUMLAH STEP dihitung OTOMATIS dari jumlah baris data (N):
 #   extra_detik  = (N - lookback) * 1 detik/baris
-#   target_steps = extra_detik // 1800
-#   (minimal 1 step)
+#   target_steps = max(1, extra_detik // 1800)
 #
-# Contoh:
-#   N = 1910 baris → 1 prediksi  (t+30m)
-#   N = 3710 baris → 2 prediksi  (t+30m, t+60m)
-#   N = 5510 baris → 3 prediksi  (dst.)
+#   Contoh:
+#     N = 110  → steps = 1  (minimal, prediksi t+30m)
+#     N = 1910 → steps = 1  (t+30m)
+#     N = 3710 → steps = 2  (t+30m, t+60m)
+#     N = 5510 → steps = 3  (dst.)
 #
-# Response Flutter parse:
-#   decoded['status'] == 'success'
-#   decoded['predictions']  → List<double> qos_index
-#   decoded['total_steps']  → berapa step yang dihasilkan (dinamis)
+# Flutter parse response:
+#   decoded['status']           == 'success'
+#   decoded['predictions']      → List<double> qos_index per step
+#   decoded['total_steps']      → int, berapa step dihasilkan
+#   decoded['forecast_times']   → List<String> ["t+30m", "t+60m", ...]
+#   decoded['predictions_detail'] → List detail tiap step
 # =========================================================
 @app.post("/predict_future")
 async def predict_future(data: QoSInput):
@@ -250,7 +225,6 @@ async def predict_future(data: QoSInput):
     try:
         from pipeline import predict_future as run_future
 
-        # Tidak ada target_steps — pipeline hitung otomatis
         result = await asyncio.to_thread(
             run_future,
             data.input,
@@ -259,7 +233,7 @@ async def predict_future(data: QoSInput):
         return {
             "status"            : "success",
             "model"             : "MSSA-LSTM",
-            "total_steps"       : result["target_steps"],      # dinamis!
+            "total_steps"       : result["target_steps"],
             "interval_seconds"  : 1800,
             "forecast_times"    : result["forecast_times"],
             "predictions"       : [
@@ -277,8 +251,11 @@ async def predict_future(data: QoSInput):
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"status": "error", "message": str(e),
-                     "trace": traceback.format_exc()}
+            content={
+                "status" : "error",
+                "message": str(e),
+                "trace"  : traceback.format_exc(),
+            }
         )
 
 # =========================================================
