@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="MSSA-LSTM QoS API",
     description=(
-        "Recursive Sliding Window Forecasting berbasis "
+        "Recursive Sliding Window Forecasting, "
         "setiap prediksi menjadi input "
         "window berikutnya (replika otomatis)."
     ),
