@@ -240,77 +240,65 @@ N_FUTURE_TOTAL        = TAMPILAN_5M * INTERVAL_5M_SEC  # 43.200 step (sama untuk
 #   kita : n_future=43200 → ambil hasil[299], hasil[599], ... (per interval)
 # =========================================================
 def predict_future(raw_input: list[list[float]]) -> dict:
-    """
-    raw_input : list of list, shape TEPAT (lookback=110, 4)
-                Urutan kolom: [Throughput, Delay, Jitter, SINR]
-    Returns:
-    {
-        "predictions_5m"  : [ { "label": "t+5m",  "Throughput": ..., "qos_index": ... }, ... ],  # 144 titik
-        "predictions_30m" : [ { "label": "t+30m", "Throughput": ..., "qos_index": ... }, ... ],  # 24 titik
-    }
-    """
     if _model is None:
         warmup()
 
-    lookback = _config["lookback"]   # 110
+    lookback = _config["lookback"]
     L_MSSA   = _config["L_MSSA"]
 
-    # ── Validasi input ──────────────────────────────────────────────
     data_raw = np.array(raw_input, dtype=float)
-    if data_raw.shape[0] != lookback:
-        raise ValueError(
-            f"Input harus tepat {lookback} baris, "
-            f"diterima {data_raw.shape[0]} baris."
-        )
+    
+    # Kirim semua data, ambil 110 terakhir
+    if data_raw.shape[0] < lookback:
+        raise ValueError(f"Input harus minimal {lookback} baris")
+    data_raw = data_raw[-lookback:]  # ambil 110 terakhir
 
-    # ── Pra-proses: isi NaN → scale → MSSA (1x di awal saja) ───────
     data_raw      = pd.DataFrame(data_raw).ffill().bfill().values
     data_scaled   = _scaler_feat.transform(data_raw)
-    reconstructed = _mssa_reconstruct(data_scaled, L=L_MSSA)   # (110, 4)
+    reconstructed = _mssa_reconstruct(data_scaled, L=L_MSSA)
 
-    # ── Seed window — titik awal rekursi ────────────────────────────
-    window = reconstructed.copy()   # shape (110, 4)
+    window = reconstructed.copy()
 
-    # ── Tampung SEMUA hasil mentah ───────────────────────────────────
-    # Kita simpan semua 43.200 prediksi dulu, lalu slice per interval.
-    # Ini persis pola kode dosen — loop n_future kali, append hasilnya.
-    all_preds = []   # list of dict, panjang = N_FUTURE_TOTAL
+    predictions_5m  = []
+    predictions_30m = []
 
-    for step in range(N_FUTURE_TOTAL):
+    # Target step yang benar-benar diperlukan saja
+    targets_5m  = {(i + 1) * INTERVAL_5M_SEC  for i in range(TAMPILAN_5M)}   # 300,600,...,43200
+    targets_30m = {(i + 1) * INTERVAL_30M_SEC for i in range(TAMPILAN_30M)}  # 1800,3600,...,43200
+    all_targets  = sorted(targets_5m | targets_30m)  # 168 nilai unik
+    max_step     = all_targets[-1]  # 43200
 
-        # Langkah A — prediksi 1 detik ke depan dari window saat ini
-        pred = _predict_one_window(window)   # dict: Throughput, Delay, Jitter, SINR, qos_index
-        all_preds.append(pred)
+    # Simpan hasil hanya di step yang dibutuhkan
+    results_at = {}  # step → pred dict
 
-        # Langkah B — pred (skala asli) → skala normal = "replika"
+    step = 0
+    next_target_idx = 0
+
+    while step < max_step and next_target_idx < len(all_targets):
+        step += 1
+
+        pred = _predict_one_window(window)
+
+        # Simpan kalau ini step yang dibutuhkan
+        if step == all_targets[next_target_idx]:
+            results_at[step] = pred
+            next_target_idx += 1
+
+        # Geser window
         pred_arr    = np.array([[
             pred["Throughput (Mbps)"],
             pred["Delay (ms)"],
             pred["Jitter (ms)"],
             pred["SINR (dB)"],
         ]])
-        pred_scaled = _scaler_feat.transform(pred_arr)   # (1, 4)
+        pred_scaled = _scaler_feat.transform(pred_arr)
+        window      = np.vstack([window[1:], pred_scaled])
 
-        # Langkah C — geser window: buang tertua, sisipkan replika di ekor
-        #   Sebelum: [r2, r3, ..., r110]
-        #   Sesudah: [r3, r4, ..., r110, P_k]
-        window = np.vstack([window[1:], pred_scaled])    # tetap (110, 4)
-
-    # ── Slice hasil per interval tampilan ───────────────────────────
-    #
-    # Interval 5 menit = ambil step ke-300, 600, 900, ..., 43200
-    # Index Python    = 299, 599, 899, ..., 43199
-    #
-    # Interval 30 menit = ambil step ke-1800, 3600, ..., 43200
-    # Index Python      = 1799, 3599, ..., 43199
-
-    predictions_5m  = []
-    predictions_30m = []
-
-    for i in range(TAMPILAN_5M):                    # i = 0..143
-        idx   = (i + 1) * INTERVAL_5M_SEC - 1      # 299, 599, ..., 43199
+    # Susun output
+    for i in range(TAMPILAN_5M):
+        s     = (i + 1) * INTERVAL_5M_SEC
         menit = (i + 1) * 5
-        p     = all_preds[idx]
+        p     = results_at[s]
         predictions_5m.append({
             "label"            : f"t+{menit}m",
             "Throughput (Mbps)": p["Throughput (Mbps)"],
@@ -320,10 +308,10 @@ def predict_future(raw_input: list[list[float]]) -> dict:
             "qos_index"        : p["qos_index"],
         })
 
-    for i in range(TAMPILAN_30M):                   # i = 0..23
-        idx   = (i + 1) * INTERVAL_30M_SEC - 1     # 1799, 3599, ..., 43199
+    for i in range(TAMPILAN_30M):
+        s     = (i + 1) * INTERVAL_30M_SEC
         menit = (i + 1) * 30
-        p     = all_preds[idx]
+        p     = results_at[s]
         predictions_30m.append({
             "label"            : f"t+{menit}m",
             "Throughput (Mbps)": p["Throughput (Mbps)"],
@@ -334,8 +322,8 @@ def predict_future(raw_input: list[list[float]]) -> dict:
         })
 
     return {
-        "predictions_5m" : predictions_5m,   # 144 titik, label t+5m s/d t+720m
-        "predictions_30m": predictions_30m,  # 24 titik,  label t+30m s/d t+720m
+        "predictions_5m" : predictions_5m,
+        "predictions_30m": predictions_30m,
     }
 
 # =========================================================
