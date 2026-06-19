@@ -192,26 +192,16 @@ async def predict(data: QoSInput):
 # MEKANISME (identik Gambar 2 jurnal):
 #   Step 1 : window = [t1, t2, …, t110]           → P1
 #   Step 2 : window = [t2, t3, …, t110, P1]       → P2
-#   Step 3 : window = [t3, t4, …, t110, P1, P2]   → P3
 #   …
-#   Baris tertua dibuang, prediksi terbaru (replika) masuk di ekor.
-#
-# JUMLAH STEP dihitung OTOMATIS dari jumlah baris data (N):
-#   extra_detik  = (N - lookback) * 1 detik/baris
-#   target_steps = max(1, extra_detik // 1800)
-#
-#   Contoh:
-#     N = 110  → steps = 1  (minimal, prediksi t+30m)
-#     N = 1910 → steps = 1  (t+30m)
-#     N = 3710 → steps = 2  (t+30m, t+60m)
-#     N = 5510 → steps = 3  (dst.)
+#   Loop jalan 43.200 kali (12 jam × 3600 detik).
+#   Hasil diambil setiap 300 step  → tampilan per 5 menit  (144 titik)
+#   Hasil diambil setiap 1800 step → tampilan per 30 menit (24 titik)
 #
 # Flutter parse response:
-#   decoded['status']           == 'success'
-#   decoded['predictions']      → List<double> qos_index per step
-#   decoded['total_steps']      → int, berapa step dihasilkan
-#   decoded['forecast_times']   → List<String> ["t+30m", "t+60m", ...]
-#   decoded['predictions_detail'] → List detail tiap step
+#   decoded['status']              == 'success'
+#   decoded['predictions_5m']      → List<Map> 144 titik, label t+5m..t+720m
+#   decoded['predictions_30m']     → List<Map> 24 titik,  label t+30m..t+720m
+#   Tiap item punya: label, Throughput(Mbps), Delay(ms), Jitter(ms), SINR(dB), qos_index
 # =========================================================
 @app.post("/predict_future")
 async def predict_future(data: QoSInput):
@@ -231,16 +221,11 @@ async def predict_future(data: QoSInput):
         )
 
         return {
-            "status"            : "success",
-            "model"             : "MSSA-LSTM",
-            "total_steps"       : result["target_steps"],
-            "interval_seconds"  : 1800,
-            "forecast_times"    : result["forecast_times"],
-            "predictions"       : [
-                p["qos_index"] for p in result["future_predictions"]
-            ],
-            "final_prediction"  : result["final_prediction"],
-            "predictions_detail": result["future_predictions"],
+            "status"          : "success",
+            "model"           : "MSSA-LSTM",
+            "max_hours"       : 12,
+            "predictions_5m"  : result["predictions_5m"],   # 144 titik
+            "predictions_30m" : result["predictions_30m"],  # 24 titik
         }
 
     except ValueError as e:

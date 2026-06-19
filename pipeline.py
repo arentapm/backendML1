@@ -175,7 +175,6 @@ def _compute_target_steps(
     )
     return steps
 
-
 # =========================================================
 # PREDICT CURRENT — 1 prediksi dari window terakhir
 # Dipanggil oleh /predict
@@ -208,128 +207,136 @@ def predict_current(raw_input: list[list[float]]) -> dict:
 
 
 # =========================================================
-# PREDICT FUTURE — Recursive Sliding Window (jurnal arXiv:2511.11630)
+# CONFIG — tambahkan ini di bagian atas
+# =========================================================
+BASE_DIR              = Path(__file__).resolve().parent
+MODELS_DIR            = BASE_DIR / "models"
+BUFFER_SIZE           = 1800
+PREDICT_INTERVAL      = 1
+MIN_DATA_TO_PRED      = 110
+DATA_INTERVAL_SECONDS = 1
+
+MAX_HOURS             = 12                        # tampilan maksimal 12 jam
+INTERVAL_5M_SEC       = 5  * 60                  # 300 detik per titik
+INTERVAL_30M_SEC      = 30 * 60                  # 1800 detik per titik
+TAMPILAN_5M           = (MAX_HOURS * 60) // 5    # 144 titik
+TAMPILAN_30M          = (MAX_HOURS * 60) // 30   # 24 titik
+N_FUTURE_TOTAL        = TAMPILAN_5M * INTERVAL_5M_SEC  # 43.200 step (sama untuk keduanya)
+
+
+# =========================================================
+# PREDICT FUTURE — Recursive Sliding Window
 #
-# KONSEP (persis seperti di jurnal):
-#   Diberikan window awal berisi data nyata [t1 … t_lookback]:
+# Input  : tepat 110 baris data nyata (lookback)
+# Loop   : 43.200 kali — persis seperti kode dosen (n_future=300)
+#          tapi n_future-nya 43.200 karena mau prediksi 12 jam
 #
-#   Step 1:  input = [t1,  t2,  …, t110]          → prediksi P1
-#   Step 2:  input = [t2,  t3,  …, t110, P1]      → prediksi P2
-#   Step 3:  input = [t3,  t4,  …, t110, P1, P2]  → prediksi P3
-#   …
-#   Step k:  window tertua dibuang, replika terbaru masuk di ekor
+# Hasil diambil dari:
+#   - Setiap step ke-300, 600, ..., 43200  → tampilan per 5 menit (144 titik)
+#   - Setiap step ke-1800, 3600, ..., 43200 → tampilan per 30 menit (24 titik)
 #
-#   Ini identik dengan Gambar 2 & Persamaan (3)–(4) di jurnal tsb:
-#       y1 = f(x_t0, x_t1, x_t2, x_t3, x_t4)   ← versi jurnal (window=5)
-#       y2 = f(x_t1, x_t2, x_t3, x_t4, y1)
-#       y3 = f(x_t2, x_t3, x_t4, y1,   y2)
-#
-#   Pada kode ini window = lookback (110), 
-#   prediksi sebelumnya menggantikan elemen tertua → window bergeser maju terus.
-#
-# Dipanggil oleh /predict_future
+# Contoh analogi kode dosen:
+#   dosen: n_future=300 → ambil semua 300 hasil
+#   kita : n_future=43200 → ambil hasil[299], hasil[599], ... (per interval)
 # =========================================================
 def predict_future(raw_input: list[list[float]]) -> dict:
     """
-    raw_input : list of list, shape (N, 4), N >= lookback
+    raw_input : list of list, shape TEPAT (lookback=110, 4)
+                Urutan kolom: [Throughput, Delay, Jitter, SINR]
     Returns:
     {
-        "future_predictions": [
-            {
-                "Throughput (Mbps)": float,
-                "Delay (ms)"       : float,
-                "Jitter (ms)"      : float,
-                "SINR (dB)"        : float,
-                "qos_index"        : float,
-                "step"             : int,   # 1-based
-            },
-            ...
-        ],
-        "final_prediction" : float,          # qos_index langkah terakhir
-        "forecast_times"   : ["t+30m", ...], # label waktu tiap step
-        "target_steps"     : int,
+        "predictions_5m"  : [ { "label": "t+5m",  "Throughput": ..., "qos_index": ... }, ... ],  # 144 titik
+        "predictions_30m" : [ { "label": "t+30m", "Throughput": ..., "qos_index": ... }, ... ],  # 24 titik
     }
     """
     if _model is None:
         warmup()
 
-    lookback = _config["lookback"]
+    lookback = _config["lookback"]   # 110
     L_MSSA   = _config["L_MSSA"]
 
-    # ── Pra-proses: isi NaN, scale, rekonstruksi MSSA ──────────────
-    data_raw      = np.array(raw_input, dtype=float)
-    data_raw      = pd.DataFrame(data_raw).ffill().bfill().values
-    data_scaled   = _scaler_feat.transform(data_raw)
-    reconstructed = _mssa_reconstruct(data_scaled, L=L_MSSA)
-
-    N = len(reconstructed)
-    if N < lookback:
-        raise ValueError(f"Data tidak cukup: {N} baris, butuh minimal {lookback}")
-
-    # ── Hitung berapa step yang akan diprediksi ─────────────────────
-    target_steps = _compute_target_steps(N, lookback)
-
-    # ── DEBUG: cek seed window ──────────────────────────────────────
-    seed_window = reconstructed[-lookback:].copy()   # shape (lookback, 4)
-    seed_ori    = _scaler_feat.inverse_transform(seed_window)
-    print(f"[DEBUG] Seed window mean  (asli) = {seed_ori.mean(axis=0).round(4)}")
-    print(f"[DEBUG] Seed window akhir (asli) = {seed_ori[-1].round(4)}")
-
-    # ── RECURSIVE SLIDING WINDOW (inti jurnal) ──────────────────────
-    #
-    #  Iterasi 1  : window = [t1 … t_lookback]           → P1
-    #  Iterasi 2  : window = [t2 … t_lookback, P1_sc]    → P2
-    #  Iterasi k  : window = [..., P(k-2)_sc, P(k-1)_sc] → Pk
-    #
-    #  Setiap hasil prediksi (skala asli) di-transform balik ke
-    #  skala normal (pred_scaled) lalu di-vstack ke ekor window,
-    #  sementara baris paling lama (index 0) dibuang.
-    # ───────────────────────────────────────────────────────────────
-    future_preds = []
-    window       = seed_window.copy()   # shape (lookback, 4), skala normal
-
-    for step in range(target_steps):
-
-        # Langkah A — prediksi 1 step ke depan
-        pred = _predict_one_window(window)
-        pred["step"] = step + 1
-        future_preds.append(pred)
-
-        print(
-            f"[DEBUG] Step {step+1:02d}: "
-            f"Throughput={pred['Throughput (Mbps)']:.4f}  "
-            f"Delay={pred['Delay (ms)']:.4f}  "
-            f"Jitter={pred['Jitter (ms)']:.4f}  "
-            f"SINR={pred['SINR (dB)']:.4f}  "
-            f"→ QoS={pred['qos_index']:.4f}"
+    # ── Validasi input ──────────────────────────────────────────────
+    data_raw = np.array(raw_input, dtype=float)
+    if data_raw.shape[0] != lookback:
+        raise ValueError(
+            f"Input harus tepat {lookback} baris, "
+            f"diterima {data_raw.shape[0]} baris."
         )
 
-        # Langkah B — konversi prediksi (skala asli) → skala normal
-        #             ini yang disebut "replika"
+    # ── Pra-proses: isi NaN → scale → MSSA (1x di awal saja) ───────
+    data_raw      = pd.DataFrame(data_raw).ffill().bfill().values
+    data_scaled   = _scaler_feat.transform(data_raw)
+    reconstructed = _mssa_reconstruct(data_scaled, L=L_MSSA)   # (110, 4)
+
+    # ── Seed window — titik awal rekursi ────────────────────────────
+    window = reconstructed.copy()   # shape (110, 4)
+
+    # ── Tampung SEMUA hasil mentah ───────────────────────────────────
+    # Kita simpan semua 43.200 prediksi dulu, lalu slice per interval.
+    # Ini persis pola kode dosen — loop n_future kali, append hasilnya.
+    all_preds = []   # list of dict, panjang = N_FUTURE_TOTAL
+
+    for step in range(N_FUTURE_TOTAL):
+
+        # Langkah A — prediksi 1 detik ke depan dari window saat ini
+        pred = _predict_one_window(window)   # dict: Throughput, Delay, Jitter, SINR, qos_index
+        all_preds.append(pred)
+
+        # Langkah B — pred (skala asli) → skala normal = "replika"
         pred_arr    = np.array([[
             pred["Throughput (Mbps)"],
             pred["Delay (ms)"],
             pred["Jitter (ms)"],
             pred["SINR (dB)"],
         ]])
-        pred_scaled = _scaler_feat.transform(pred_arr)   # shape (1, 4)
+        pred_scaled = _scaler_feat.transform(pred_arr)   # (1, 4)
 
-        # Langkah C — geser window: buang baris tertua, sisipkan replika
-        #
-        #   Sebelum : [t1,  t2,  …, t(lookback)]
-        #   Sesudah  : [t2,  t3,  …, t(lookback), Pk_scaled]
-        window = np.vstack([window[1:], pred_scaled])   # shape tetap (lookback, 4)
+        # Langkah C — geser window: buang tertua, sisipkan replika di ekor
+        #   Sebelum: [r2, r3, ..., r110]
+        #   Sesudah: [r3, r4, ..., r110, P_k]
+        window = np.vstack([window[1:], pred_scaled])    # tetap (110, 4)
+
+    # ── Slice hasil per interval tampilan ───────────────────────────
+    #
+    # Interval 5 menit = ambil step ke-300, 600, 900, ..., 43200
+    # Index Python    = 299, 599, 899, ..., 43199
+    #
+    # Interval 30 menit = ambil step ke-1800, 3600, ..., 43200
+    # Index Python      = 1799, 3599, ..., 43199
+
+    predictions_5m  = []
+    predictions_30m = []
+
+    for i in range(TAMPILAN_5M):                    # i = 0..143
+        idx   = (i + 1) * INTERVAL_5M_SEC - 1      # 299, 599, ..., 43199
+        menit = (i + 1) * 5
+        p     = all_preds[idx]
+        predictions_5m.append({
+            "label"            : f"t+{menit}m",
+            "Throughput (Mbps)": p["Throughput (Mbps)"],
+            "Delay (ms)"       : p["Delay (ms)"],
+            "Jitter (ms)"      : p["Jitter (ms)"],
+            "SINR (dB)"        : p["SINR (dB)"],
+            "qos_index"        : p["qos_index"],
+        })
+
+    for i in range(TAMPILAN_30M):                   # i = 0..23
+        idx   = (i + 1) * INTERVAL_30M_SEC - 1     # 1799, 3599, ..., 43199
+        menit = (i + 1) * 30
+        p     = all_preds[idx]
+        predictions_30m.append({
+            "label"            : f"t+{menit}m",
+            "Throughput (Mbps)": p["Throughput (Mbps)"],
+            "Delay (ms)"       : p["Delay (ms)"],
+            "Jitter (ms)"      : p["Jitter (ms)"],
+            "SINR (dB)"        : p["SINR (dB)"],
+            "qos_index"        : p["qos_index"],
+        })
 
     return {
-        "future_predictions": future_preds,
-        "final_prediction"  : future_preds[-1]["qos_index"],
-        "forecast_times"    : [
-            f"t+{(i + 1) * (FORECAST_INTERVAL_SECONDS // 60)}m"
-            for i in range(target_steps)
-        ],
-        "target_steps"      : target_steps,
+        "predictions_5m" : predictions_5m,   # 144 titik, label t+5m s/d t+720m
+        "predictions_30m": predictions_30m,  # 24 titik,  label t+30m s/d t+720m
     }
-
 
 # =========================================================
 # PUSH DATA — kompatibilitas streaming
