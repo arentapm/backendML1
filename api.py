@@ -1,11 +1,19 @@
 # =========================================================
 # API FASTAPI - MSSA-LSTM QoS PREDICTION
 # Input: batch List[List[float]] dari Flutter SQLite
-# Referensi: Recursive Sliding Window (arXiv:2511.11630)
+# Referensi: Recursive Sliding Window
+#
+# /predict_future sekarang ASYNC JOB:
+#   1. POST /predict_future       → return job_id langsung (instan)
+#   2. GET  /predict_future/{id}  → polling status & progress
+#   3. Saat status == "success"   → hasil ada di response (predictions_5m/30m)
 # =========================================================
 
+import time
+import uuid
 import traceback
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -16,9 +24,10 @@ from pydantic import BaseModel, field_validator
 # =========================================================
 # KONSTANTA
 # =========================================================
-MIN_ROWS   = 110   # = lookback (tidak perlu +1 karena predict_future
-                   #   tidak butuh data SETELAH window, window IS-nya data)
+MIN_ROWS   = 110   # = lookback
 N_FEATURES = 4     # Throughput, Delay, Jitter, SINR
+
+JOB_TTL_SECONDS = 6 * 3600   # job lama dihapus otomatis setelah 6 jam
 
 # =========================================================
 # STATE
@@ -26,8 +35,23 @@ N_FEATURES = 4     # Throughput, Delay, Jitter, SINR
 _model_ready   = False
 _model_loading = False
 
+# Struktur tiap job:
+# {
+#   "status"   : "queued" | "processing" | "success" | "error" | "waiting",
+#   "progress" : 0-100,
+#   "message"  : str | None,
+#   "result"   : dict | None,
+#   "created_at": float (epoch),
+# }
+_jobs: dict[str, dict] = {}
+
+# Thread pool khusus untuk kerja berat (model inference berulang).
+# Dipisah dari default executor agar tidak bentrok dengan endpoint lain.
+_executor = ThreadPoolExecutor(max_workers=2)
+
+
 # =========================================================
-# BACKGROUND LOADING
+# BACKGROUND LOADING MODEL
 # =========================================================
 async def _load_model_background():
     global _model_ready, _model_loading
@@ -44,6 +68,17 @@ async def _load_model_background():
         print(f"[API] Gagal load model: {e}")
         traceback.print_exc()
 
+
+def _cleanup_old_jobs():
+    now = time.time()
+    expired = [
+        jid for jid, j in _jobs.items()
+        if now - j["created_at"] > JOB_TTL_SECONDS
+    ]
+    for jid in expired:
+        _jobs.pop(jid, None)
+
+
 # =========================================================
 # LIFESPAN
 # =========================================================
@@ -51,6 +86,8 @@ async def _load_model_background():
 async def lifespan(app: FastAPI):
     asyncio.create_task(_load_model_background())
     yield
+    _executor.shutdown(wait=False)
+
 
 # =========================================================
 # APP
@@ -133,11 +170,7 @@ async def status():
     }
 
 # =========================================================
-# /predict — 1 prediksi dari window terakhir (real-time)
-#
-# Dipakai untuk monitoring langsung:
-#   - Ambil N baris terakhir dari buffer SQLite
-#   - Prediksi 1 step ke depan tanpa rekursi
+# /predict — 1 prediksi dari window terakhir
 # =========================================================
 @app.post("/predict")
 async def predict(data: QoSInput):
@@ -187,24 +220,52 @@ async def predict(data: QoSInput):
         )
 
 # =========================================================
-# /predict_future — Recursive Sliding Window (arXiv:2511.11630)
+# WORKER — dijalankan di thread terpisah, update _jobs[job_id]
+# =========================================================
+def _run_predict_future_job(job_id: str, input_data: list[list[float]]):
+    from pipeline import predict_future as run_future
+
+    def on_progress(done: int, total: int):
+        if job_id in _jobs:
+            _jobs[job_id]["progress"] = round(done / total * 100, 1)
+
+    try:
+        _jobs[job_id]["status"] = "processing"
+
+        result = run_future(input_data, progress_callback=on_progress)
+
+        _jobs[job_id].update({
+            "status"  : "success",
+            "progress": 100,
+            "result"  : {
+                "predictions_5m" : result["predictions_5m"],
+                "predictions_30m": result["predictions_30m"],
+            },
+            "message": None,
+        })
+
+    except ValueError as e:
+        _jobs[job_id].update({
+            "status" : "error",
+            "message": str(e),
+        })
+    except Exception as e:
+        traceback.print_exc()
+        _jobs[job_id].update({
+            "status" : "error",
+            "message": str(e),
+        })
+
+
+# =========================================================
+# /predict_future — START JOB
 #
-# MEKANISME (identik Gambar 2 jurnal):
-#   Step 1 : window = [t1, t2, …, t110]           → P1
-#   Step 2 : window = [t2, t3, …, t110, P1]       → P2
-#   …
-#   Loop jalan 43.200 kali (12 jam × 3600 detik).
-#   Hasil diambil setiap 300 step  → tampilan per 5 menit  (144 titik)
-#   Hasil diambil setiap 1800 step → tampilan per 30 menit (24 titik)
-#
-# Flutter parse response:
-#   decoded['status']              == 'success'
-#   decoded['predictions_5m']      → List<Map> 144 titik, label t+5m..t+720m
-#   decoded['predictions_30m']     → List<Map> 24 titik,  label t+30m..t+720m
-#   Tiap item punya: label, Throughput(Mbps), Delay(ms), Jitter(ms), SINR(dB), qos_index
+# Response:
+#   {"status": "queued", "job_id": "..."}
+# Flutter lalu polling GET /predict_future/{job_id}
 # =========================================================
 @app.post("/predict_future")
-async def predict_future(data: QoSInput):
+async def predict_future_start(data: QoSInput):
 
     err = _check_model()
     if err: return err
@@ -212,36 +273,72 @@ async def predict_future(data: QoSInput):
     err = _check_min_rows(len(data.input))
     if err: return err
 
-    try:
-        from pipeline import predict_future as run_future
+    _cleanup_old_jobs()
 
-        result = await asyncio.to_thread(
-            run_future,
-            data.input,
+    job_id = uuid.uuid4().hex
+    _jobs[job_id] = {
+        "status"    : "queued",
+        "progress"  : 0,
+        "message"   : None,
+        "result"    : None,
+        "created_at": time.time(),
+    }
+
+    loop = asyncio.get_running_loop()
+    # Lempar kerja berat ke thread pool — tidak diawait, supaya endpoint
+    # langsung return job_id ke client.
+    loop.run_in_executor(_executor, _run_predict_future_job, job_id, data.input)
+
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "message": "Forecast sedang diproses, gunakan job_id untuk polling",
+    }
+
+
+# =========================================================
+# /predict_future/{job_id} — POLLING STATUS
+#
+# Response saat masih proses:
+#   {"status": "processing", "progress": 42.5}
+# Response saat sukses:
+#   {"status": "success", "progress": 100,
+#    "predictions_5m": [...], "predictions_30m": [...]}
+# Response saat gagal:
+#   {"status": "error", "message": "..."}
+# =========================================================
+@app.get("/predict_future/{job_id}")
+async def predict_future_status(job_id: str):
+    job = _jobs.get(job_id)
+
+    if job is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "job_id tidak ditemukan atau sudah kedaluwarsa"},
         )
 
+    if job["status"] == "success":
         return {
             "status"          : "success",
+            "progress"        : 100,
             "model"           : "MSSA-LSTM",
             "max_hours"       : 12,
-            "predictions_5m"  : result["predictions_5m"],   # 144 titik
-            "predictions_30m" : result["predictions_30m"],  # 24 titik
+            "predictions_5m"  : job["result"]["predictions_5m"],
+            "predictions_30m" : job["result"]["predictions_30m"],
         }
 
-    except ValueError as e:
-        return JSONResponse(
-            status_code=422,
-            content={"status": "error", "message": str(e)}
-        )
-    except Exception as e:
+    if job["status"] == "error":
         return JSONResponse(
             status_code=500,
-            content={
-                "status" : "error",
-                "message": str(e),
-                "trace"  : traceback.format_exc(),
-            }
+            content={"status": "error", "message": job["message"]},
         )
+
+    # queued / processing
+    return {
+        "status"  : job["status"],
+        "progress": job["progress"],
+    }
+
 
 # =========================================================
 # MAIN

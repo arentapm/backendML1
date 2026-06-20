@@ -6,27 +6,33 @@ from collections import deque
 from pathlib import Path
 from scipy.linalg import svd
 from tensorflow.keras.models import load_model
+from typing import Callable, Optional
 
 # =========================================================
 # CONFIG
 # =========================================================
-BASE_DIR             = Path(__file__).resolve().parent
-MODELS_DIR           = BASE_DIR / "models"
-BUFFER_SIZE          = 1800   # 30 menit data (1 baris = 1 detik)
-PREDICT_INTERVAL     = 1
-MIN_DATA_TO_PRED     = 110    # = lookback
-DATA_INTERVAL_SECONDS   = 1
-FORECAST_INTERVAL_SECONDS = 1800  # 30 menit
+BASE_DIR              = Path(__file__).resolve().parent
+MODELS_DIR            = BASE_DIR / "models"
+BUFFER_SIZE           = 1800   # 30 menit data (1 baris = 1 detik)
+PREDICT_INTERVAL      = 1
+MIN_DATA_TO_PRED      = 110    # = lookback
+DATA_INTERVAL_SECONDS = 1
+
+MAX_HOURS        = 12                          # tampilan maksimal 12 jam
+INTERVAL_5M_SEC  = 5  * 60                      # 300 detik per titik
+INTERVAL_30M_SEC = 30 * 60                      # 1800 detik per titik
+TAMPILAN_5M      = (MAX_HOURS * 60) // 5        # 144 titik
+TAMPILAN_30M     = (MAX_HOURS * 60) // 30       # 24 titik
 
 # =========================================================
 # ARTIFACTS
 # =========================================================
-_model        = None
-_scaler_feat  = None
-_config       = None
-_buffer       = deque(maxlen=BUFFER_SIZE)
-_tick_count   = 0
-_last_result  = None
+_model       = None
+_scaler_feat = None
+_config      = None
+_buffer      = deque(maxlen=BUFFER_SIZE)
+_tick_count  = 0
+_last_result = None
 
 
 def warmup():
@@ -149,33 +155,6 @@ def _predict_one_window(window_scaled: np.ndarray) -> dict:
 
 
 # =========================================================
-# HITUNG TARGET_STEPS OTOMATIS
-#
-# Logika (sesuai jurnal "Predicting Grain Growth..." arXiv:2511.11630):
-#   - Seed window = lookback baris pertama (data asli)
-#   - Setiap step menggeser window 1 prediksi ke depan
-#   - Jumlah step = berapa kali 30 menit muat di sisa data
-#
-# Contoh:
-#   N = 110  → extra=0  → steps=1  (minimal 1 prediksi)
-#   N = 1910 → extra=1800s → steps=1
-#   N = 3710 → extra=3600s → steps=2
-# =========================================================
-def _compute_target_steps(
-    n_rows:              int,
-    lookback:            int,
-    data_interval_sec:   int = DATA_INTERVAL_SECONDS,
-    forecast_interval_sec: int = FORECAST_INTERVAL_SECONDS,
-) -> int:
-    extra_seconds = (n_rows - lookback) * data_interval_sec
-    steps         = max(1, int(extra_seconds // forecast_interval_sec))
-    print(
-        f"[Replika Otomatis] N={n_rows}, lookback={lookback}, "
-        f"extra={extra_seconds}s → target_steps={steps}"
-    )
-    return steps
-
-# =========================================================
 # PREDICT CURRENT — 1 prediksi dari window terakhir
 # Dipanggil oleh /predict
 # =========================================================
@@ -191,8 +170,8 @@ def predict_current(raw_input: list[list[float]]) -> dict:
     lookback = _config["lookback"]
     L_MSSA   = _config["L_MSSA"]
 
-    data_raw   = np.array(raw_input, dtype=float)
-    data_raw   = pd.DataFrame(data_raw).ffill().bfill().values
+    data_raw      = np.array(raw_input, dtype=float)
+    data_raw      = pd.DataFrame(data_raw).ffill().bfill().values
     data_scaled   = _scaler_feat.transform(data_raw)
     reconstructed = _mssa_reconstruct(data_scaled, L=L_MSSA)
 
@@ -207,39 +186,23 @@ def predict_current(raw_input: list[list[float]]) -> dict:
 
 
 # =========================================================
-# CONFIG — tambahkan ini di bagian atas
-# =========================================================
-BASE_DIR              = Path(__file__).resolve().parent
-MODELS_DIR            = BASE_DIR / "models"
-BUFFER_SIZE           = 1800
-PREDICT_INTERVAL      = 1
-MIN_DATA_TO_PRED      = 110
-DATA_INTERVAL_SECONDS = 1
-
-MAX_HOURS             = 12                        # tampilan maksimal 12 jam
-INTERVAL_5M_SEC       = 5  * 60                  # 300 detik per titik
-INTERVAL_30M_SEC      = 30 * 60                  # 1800 detik per titik
-TAMPILAN_5M           = (MAX_HOURS * 60) // 5    # 144 titik
-TAMPILAN_30M          = (MAX_HOURS * 60) // 30   # 24 titik
-N_FUTURE_TOTAL        = TAMPILAN_5M * INTERVAL_5M_SEC  # 43.200 step (sama untuk keduanya)
-
-
-# =========================================================
 # PREDICT FUTURE — Recursive Sliding Window
 #
-# Input  : tepat 110 baris data nyata (lookback)
-# Loop   : 43.200 kali — persis seperti kode dosen (n_future=300)
-#          tapi n_future-nya 43.200 karena mau prediksi 12 jam
+# Input  : minimal `lookback` (110) baris data nyata, dipakai 110 terakhir
+# Loop   : berjalan sampai step target terbesar (43.200 untuk 12 jam @5 menit)
 #
 # Hasil diambil dari:
-#   - Setiap step ke-300, 600, ..., 43200  → tampilan per 5 menit (144 titik)
+#   - Setiap step ke-300, 600, ..., 43200  → tampilan per 5 menit  (144 titik)
 #   - Setiap step ke-1800, 3600, ..., 43200 → tampilan per 30 menit (24 titik)
 #
-# Contoh analogi kode dosen:
-#   dosen: n_future=300 → ambil semua 300 hasil
-#   kita : n_future=43200 → ambil hasil[299], hasil[599], ... (per interval)
+# progress_callback(done_steps, total_steps) dipanggil secara berkala
+# agar caller (api.py) bisa update progress job ke client.
 # =========================================================
-def predict_future(raw_input: list[list[float]]) -> dict:
+def predict_future(
+    raw_input: list[list[float]],
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    progress_every: int = 200,
+) -> dict:
     if _model is None:
         warmup()
 
@@ -247,11 +210,12 @@ def predict_future(raw_input: list[list[float]]) -> dict:
     L_MSSA   = _config["L_MSSA"]
 
     data_raw = np.array(raw_input, dtype=float)
-    
-    # Kirim semua data, ambil 110 terakhir
+
     if data_raw.shape[0] < lookback:
         raise ValueError(f"Input harus minimal {lookback} baris")
-    data_raw = data_raw[-lookback:]  # ambil 110 terakhir
+
+    # Ambil `lookback` baris terakhir (jaga-jaga kalau Flutter kirim lebih banyak)
+    data_raw = data_raw[-lookback:]
 
     data_raw      = pd.DataFrame(data_raw).ffill().bfill().values
     data_scaled   = _scaler_feat.transform(data_raw)
@@ -259,33 +223,24 @@ def predict_future(raw_input: list[list[float]]) -> dict:
 
     window = reconstructed.copy()
 
-    predictions_5m  = []
-    predictions_30m = []
-
     # Target step yang benar-benar diperlukan saja
-    targets_5m  = {(i + 1) * INTERVAL_5M_SEC  for i in range(TAMPILAN_5M)}   # 300,600,...,43200
-    targets_30m = {(i + 1) * INTERVAL_30M_SEC for i in range(TAMPILAN_30M)}  # 1800,3600,...,43200
-    all_targets  = sorted(targets_5m | targets_30m)  # 168 nilai unik
-    max_step     = all_targets[-1]  # 43200
+    targets_5m  = {(i + 1) * INTERVAL_5M_SEC  for i in range(TAMPILAN_5M)}
+    targets_30m = {(i + 1) * INTERVAL_30M_SEC for i in range(TAMPILAN_30M)}
+    all_targets = sorted(targets_5m | targets_30m)  # 168 nilai unik
+    max_step    = all_targets[-1]                   # 43200
 
-    # Simpan hasil hanya di step yang dibutuhkan
-    results_at = {}  # step → pred dict
-
-    step = 0
+    results_at: dict[int, dict] = {}
     next_target_idx = 0
 
-    while step < max_step and next_target_idx < len(all_targets):
-        step += 1
-
+    for step in range(1, max_step + 1):
         pred = _predict_one_window(window)
 
-        # Simpan kalau ini step yang dibutuhkan
-        if step == all_targets[next_target_idx]:
+        if next_target_idx < len(all_targets) and step == all_targets[next_target_idx]:
             results_at[step] = pred
             next_target_idx += 1
 
-        # Geser window
-        pred_arr    = np.array([[
+        # Geser window: buang tertua, sisipkan hasil prediksi di ekor
+        pred_arr = np.array([[
             pred["Throughput (Mbps)"],
             pred["Delay (ms)"],
             pred["Jitter (ms)"],
@@ -294,7 +249,11 @@ def predict_future(raw_input: list[list[float]]) -> dict:
         pred_scaled = _scaler_feat.transform(pred_arr)
         window      = np.vstack([window[1:], pred_scaled])
 
-    # Susun output
+        if progress_callback is not None and (step % progress_every == 0 or step == max_step):
+            progress_callback(step, max_step)
+
+    # Susun output per interval tampilan
+    predictions_5m = []
     for i in range(TAMPILAN_5M):
         s     = (i + 1) * INTERVAL_5M_SEC
         menit = (i + 1) * 5
@@ -308,6 +267,7 @@ def predict_future(raw_input: list[list[float]]) -> dict:
             "qos_index"        : p["qos_index"],
         })
 
+    predictions_30m = []
     for i in range(TAMPILAN_30M):
         s     = (i + 1) * INTERVAL_30M_SEC
         menit = (i + 1) * 30
@@ -325,6 +285,7 @@ def predict_future(raw_input: list[list[float]]) -> dict:
         "predictions_5m" : predictions_5m,
         "predictions_30m": predictions_30m,
     }
+
 
 # =========================================================
 # PUSH DATA — kompatibilitas streaming
@@ -355,7 +316,7 @@ def push_data(row: dict) -> dict | None:
     if _tick_count % PREDICT_INTERVAL != 0:
         return _last_result
 
-    result      = predict_current(list(_buffer))
+    result       = predict_current(list(_buffer))
     _last_result = {
         "status"     : "ok",
         **result["current_prediction"],
