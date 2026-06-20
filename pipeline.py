@@ -18,11 +18,11 @@ PREDICT_INTERVAL      = 1
 MIN_DATA_TO_PRED      = 110    # = lookback
 DATA_INTERVAL_SECONDS = 1
 
-MAX_HOURS        = 2                         # tampilan maksimal 2 jam
+MAX_HOURS        = 2                           # tampilan maksimal 2 jam (demo cepat)
 INTERVAL_5M_SEC  = 5  * 60                      # 300 detik per titik
 INTERVAL_30M_SEC = 30 * 60                      # 1800 detik per titik
-TAMPILAN_5M      = (MAX_HOURS * 60) // 5        # 24 titik
-TAMPILAN_30M     = (MAX_HOURS * 60) // 30       # 4 titik
+TAMPILAN_5M      = (MAX_HOURS * 60) // 5        # 144 titik
+TAMPILAN_30M     = (MAX_HOURS * 60) // 30       # 24 titik
 
 # =========================================================
 # ARTIFACTS
@@ -134,18 +134,30 @@ def _mssa_reconstruct(data_scaled, L=50):
 
 # =========================================================
 # HELPER: 1 PREDIKSI DARI 1 WINDOW
+#
+# PENTING — pola rekursif yang BENAR (sama seperti notebook dosen):
+#   Model menerima window dalam skala SCALED, dan outputnya (pred_sc)
+#   JUGA dalam skala SCALED. Untuk langkah rekursif berikutnya, kita
+#   HARUS memakai pred_sc apa adanya (TANPA inverse_transform lalu
+#   transform lagi), karena round-trip scaler + pembulatan akan
+#   mengakumulasi error tiap step dan membuat hasil "flat"/jenuh
+#   setelah puluhan step.
+#
+#   inverse_transform hanya dipakai untuk PELAPORAN (qos_index, nilai
+#   yang ditampilkan ke user) — bukan untuk feedback ke window.
 # =========================================================
 def _predict_one_window(window_scaled: np.ndarray) -> dict:
     """
     window_scaled : shape (lookback, 4) — sudah dinormalisasi & direkonstruksi MSSA
-    Returns       : dict prediksi lengkap (skala asli)
+    Returns       : dict berisi nilai scaled (untuk rekursi) + nilai asli (untuk laporan)
     """
     lookback = _config["lookback"]
     inp      = window_scaled[-lookback:].astype(np.float32).reshape(1, lookback, 4)
-    pred_sc  = _model.predict(inp, verbose=0)[0]
-    pred_ori = _scaler_feat.inverse_transform(pred_sc.reshape(1, -1))[0]
+    pred_sc  = _model.predict(inp, verbose=0)[0]                              # skala scaled — dipakai untuk rekursi
+    pred_ori = _scaler_feat.inverse_transform(pred_sc.reshape(1, -1))[0]      # skala asli — hanya untuk laporan
     qos      = compute_qos_index(*pred_ori)
     return {
+        "scaled"           : pred_sc,                 # np.ndarray (4,), TIDAK dibulatkan — untuk geser window
         "Throughput (Mbps)": round(float(pred_ori[0]), 4),
         "Delay (ms)"       : round(float(pred_ori[1]), 4),
         "Jitter (ms)"      : round(float(pred_ori[2]), 4),
@@ -239,14 +251,10 @@ def predict_future(
             results_at[step] = pred
             next_target_idx += 1
 
-        # Geser window: buang tertua, sisipkan hasil prediksi di ekor
-        pred_arr = np.array([[
-            pred["Throughput (Mbps)"],
-            pred["Delay (ms)"],
-            pred["Jitter (ms)"],
-            pred["SINR (dB)"],
-        ]])
-        pred_scaled = _scaler_feat.transform(pred_arr)
+        # Geser window: buang tertua, sisipkan PREDIKSI SCALED langsung
+        # dari model (bukan hasil inverse_transform → transform lagi).
+        # Ini mereplikasi persis pola notebook dosen: window.append(pred_scaled)
+        pred_scaled = pred["scaled"].reshape(1, -1)
         window      = np.vstack([window[1:], pred_scaled])
 
         if progress_callback is not None and (step % progress_every == 0 or step == max_step):

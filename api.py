@@ -1,7 +1,7 @@
 # =========================================================
 # API FASTAPI - MSSA-LSTM QoS PREDICTION
 # Input: batch List[List[float]] dari Flutter SQLite
-# Referensi: Recursive Sliding Window
+# Referensi: Recursive Sliding Window (arXiv:2511.11630)
 #
 # /predict_future sekarang ASYNC JOB:
 #   1. POST /predict_future       → return job_id langsung (instan)
@@ -35,6 +35,7 @@ JOB_TTL_SECONDS = 6 * 3600   # job lama dihapus otomatis setelah 6 jam
 _model_ready   = False
 _model_loading = False
 
+# Job store di memori — aman karena 1 worker/proses (lihat catatan di bawah)
 # Struktur tiap job:
 # {
 #   "status"   : "queued" | "processing" | "success" | "error" | "waiting",
@@ -170,7 +171,7 @@ async def status():
     }
 
 # =========================================================
-# /predict — 1 prediksi dari window terakhir
+# /predict — 1 prediksi dari window terakhir (real-time, tetap sinkron)
 # =========================================================
 @app.post("/predict")
 async def predict(data: QoSInput):
@@ -258,7 +259,7 @@ def _run_predict_future_job(job_id: str, input_data: list[list[float]]):
 
 
 # =========================================================
-# /predict_future — START JOB
+# /predict_future — START JOB (instan, tidak menunggu)
 #
 # Response:
 #   {"status": "queued", "job_id": "..."}
@@ -318,11 +319,12 @@ async def predict_future_status(job_id: str):
         )
 
     if job["status"] == "success":
+        from pipeline import MAX_HOURS
         return {
             "status"          : "success",
             "progress"        : 100,
             "model"           : "MSSA-LSTM",
-            "max_hours"       : 12,
+            "max_hours"       : MAX_HOURS,
             "predictions_5m"  : job["result"]["predictions_5m"],
             "predictions_30m" : job["result"]["predictions_30m"],
         }
