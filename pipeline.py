@@ -18,11 +18,11 @@ PREDICT_INTERVAL      = 1
 MIN_DATA_TO_PRED      = 110    # = lookback
 DATA_INTERVAL_SECONDS = 1
 
-MAX_HOURS        = 12                          # tampilan maksimal 12 jam
+MAX_HOURS        = 2                         # tampilan maksimal 2 jam
 INTERVAL_5M_SEC  = 5  * 60                      # 300 detik per titik
 INTERVAL_30M_SEC = 30 * 60                      # 1800 detik per titik
-TAMPILAN_5M      = (MAX_HOURS * 60) // 5        # 144 titik
-TAMPILAN_30M     = (MAX_HOURS * 60) // 30       # 24 titik
+TAMPILAN_5M      = (MAX_HOURS * 60) // 5        # 24 titik
+TAMPILAN_30M     = (MAX_HOURS * 60) // 30       # 4 titik
 
 # =========================================================
 # ARTIFACTS
