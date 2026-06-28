@@ -85,7 +85,7 @@ def _cleanup_old_jobs():
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(_load_model_background())
+    await _load_model_background()
     yield
     _executor.shutdown(wait=False)
 
