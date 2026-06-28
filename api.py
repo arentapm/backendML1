@@ -239,7 +239,7 @@ def _run_predict_future_job(job_id: str, input_data: list[list[float]]):
             "status"  : "success",
             "progress": 100,
             "result"  : {
-                "predictions_5m" : result["predictions_5m"],
+                "predictions_5m_detail": result["predictions_5m_detail"], 
                 "predictions_30m": result["predictions_30m"],
             },
             "message": None,
@@ -319,13 +319,11 @@ async def predict_future_status(job_id: str):
         )
 
     if job["status"] == "success":
-        from pipeline import MAX_HOURS
         return {
             "status"          : "success",
             "progress"        : 100,
             "model"           : "MSSA-LSTM",
-            "max_hours"       : MAX_HOURS,
-            "predictions_5m"  : job["result"]["predictions_5m"],
+            "predictions_5m_detail": job["result"]["predictions_5m_detail"],
             "predictions_30m" : job["result"]["predictions_30m"],
         }
 

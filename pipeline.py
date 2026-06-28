@@ -18,11 +18,11 @@ PREDICT_INTERVAL      = 1
 MIN_DATA_TO_PRED      = 110    # = lookback
 DATA_INTERVAL_SECONDS = 1
 
-MAX_HOURS        = 2                           # tampilan maksimal 2 jam (demo cepat)
-INTERVAL_5M_SEC  = 5  * 60                      # 300 detik per titik
-INTERVAL_30M_SEC = 30 * 60                      # 1800 detik per titik
-TAMPILAN_5M      = (MAX_HOURS * 60) // 5        # 144 titik
-TAMPILAN_30M     = (MAX_HOURS * 60) // 30       # 24 titik
+INTERVAL_5M_SEC  = 5  * 60                      # 300 detik
+INTERVAL_30M_SEC = 30 * 60                      # 1800 detik
+TAMPILAN_5M      = 1                            # 1 titik final (t+300)
+TAMPILAN_5M_DETAIL = 300                        # semua step t+1..t+300 untuk grafik
+TAMPILAN_30M     = (2 * 60) // 30              # 24 titik
 
 # =========================================================
 # ARTIFACTS
@@ -37,7 +37,7 @@ _last_result = None
 
 def warmup():
     global _model, _scaler_feat, _config
-    _model       = load_model(MODELS_DIR / "model_qos_dengan_MSSA.keras")
+    _model       = load_model(MODELS_DIR / "model_qos_dengan_MSSA.tflite")
     _scaler_feat = joblib.load(MODELS_DIR / "scaler_feat.pkl")
     with open(MODELS_DIR / "config.json") as f:
         _config = json.load(f)
@@ -222,24 +222,21 @@ def predict_future(
     L_MSSA   = _config["L_MSSA"]
 
     data_raw = np.array(raw_input, dtype=float)
-
     if data_raw.shape[0] < lookback:
         raise ValueError(f"Input harus minimal {lookback} baris")
 
-    # Ambil `lookback` baris terakhir (jaga-jaga kalau Flutter kirim lebih banyak)
-    data_raw = data_raw[-lookback:]
-
+    data_raw      = data_raw[-lookback:]
     data_raw      = pd.DataFrame(data_raw).ffill().bfill().values
     data_scaled   = _scaler_feat.transform(data_raw)
     reconstructed = _mssa_reconstruct(data_scaled, L=L_MSSA)
 
     window = reconstructed.copy()
 
-    # Target step yang benar-benar diperlukan saja
-    targets_5m  = {(i + 1) * INTERVAL_5M_SEC  for i in range(TAMPILAN_5M)}
-    targets_30m = {(i + 1) * INTERVAL_30M_SEC for i in range(TAMPILAN_30M)}
-    all_targets = sorted(targets_5m | targets_30m)  # 168 nilai unik
-    max_step    = all_targets[-1]                   # 43200
+    # Target: semua step 1..300 (grafik 5m) + step 1800,3600,...,43200 (30m)
+    targets_5m_detail = set(range(1, INTERVAL_5M_SEC + 1))
+    targets_30m       = {(i + 1) * INTERVAL_30M_SEC for i in range(TAMPILAN_30M)}
+    all_targets       = sorted(targets_5m_detail | targets_30m)
+    max_step          = all_targets[-1]  # 43200
 
     results_at: dict[int, dict] = {}
     next_target_idx = 0
@@ -251,37 +248,25 @@ def predict_future(
             results_at[step] = pred
             next_target_idx += 1
 
-        # Geser window: buang tertua, sisipkan PREDIKSI SCALED langsung
-        # dari model (bukan hasil inverse_transform → transform lagi).
-        # Ini mereplikasi persis pola notebook dosen: window.append(pred_scaled)
         pred_scaled = pred["scaled"].reshape(1, -1)
         window      = np.vstack([window[1:], pred_scaled])
 
         if progress_callback is not None and (step % progress_every == 0 or step == max_step):
             progress_callback(step, max_step)
 
-    # Susun output per interval tampilan
-    predictions_5m = []
-    for i in range(TAMPILAN_5M):
-        s     = (i + 1) * INTERVAL_5M_SEC
-        menit = (i + 1) * 5
-        p     = results_at[s]
-        predictions_5m.append({
-            "label"            : f"t+{menit}m",
-            "Throughput (Mbps)": p["Throughput (Mbps)"],
-            "Delay (ms)"       : p["Delay (ms)"],
-            "Jitter (ms)"      : p["Jitter (ms)"],
-            "SINR (dB)"        : p["SINR (dB)"],
-            "qos_index"        : p["qos_index"],
-        })
+    # Output grafik detail 5m: t+1s .. t+300s (300 titik)
+    predictions_5m_detail = [
+        {"label": f"t+{step}s", "qos_index": results_at[step]["qos_index"]}
+        for step in range(1, INTERVAL_5M_SEC + 1)
+    ]
 
+    # Output 30m: t+30m .. t+120m (24 titik)
     predictions_30m = []
     for i in range(TAMPILAN_30M):
-        s     = (i + 1) * INTERVAL_30M_SEC
-        menit = (i + 1) * 30
-        p     = results_at[s]
+        s   = (i + 1) * INTERVAL_30M_SEC
+        p   = results_at[s]
         predictions_30m.append({
-            "label"            : f"t+{menit}m",
+            "label"            : f"t+{(i+1)*30}m",
             "Throughput (Mbps)": p["Throughput (Mbps)"],
             "Delay (ms)"       : p["Delay (ms)"],
             "Jitter (ms)"      : p["Jitter (ms)"],
@@ -290,8 +275,8 @@ def predict_future(
         })
 
     return {
-        "predictions_5m" : predictions_5m,
-        "predictions_30m": predictions_30m,
+        "predictions_5m_detail": predictions_5m_detail,
+        "predictions_30m"      : predictions_30m,
     }
 
 
