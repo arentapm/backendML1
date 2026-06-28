@@ -5,7 +5,7 @@ import pandas as pd
 from collections import deque
 from pathlib import Path
 from scipy.linalg import svd
-from tensorflow.keras.models import load_model
+import tensorflow as tf
 from typing import Callable, Optional
 
 # =========================================================
@@ -37,7 +37,7 @@ _last_result = None
 
 def warmup():
     global _model, _scaler_feat, _config
-    _model       = load_model(MODELS_DIR / "model_qos_dengan_MSSA.tflite")
+    _model       = tf.lite.Interpreter(model_path=str(MODELS_DIR / "model_qos_dengan_MSSA.tflite"))
     _scaler_feat = joblib.load(MODELS_DIR / "scaler_feat.pkl")
     with open(MODELS_DIR / "config.json") as f:
         _config = json.load(f)
@@ -147,17 +147,22 @@ def _mssa_reconstruct(data_scaled, L=50):
 #   yang ditampilkan ke user) — bukan untuk feedback ke window.
 # =========================================================
 def _predict_one_window(window_scaled: np.ndarray) -> dict:
-    """
-    window_scaled : shape (lookback, 4) — sudah dinormalisasi & direkonstruksi MSSA
-    Returns       : dict berisi nilai scaled (untuk rekursi) + nilai asli (untuk laporan)
-    """
     lookback = _config["lookback"]
-    inp      = window_scaled[-lookback:].astype(np.float32).reshape(1, lookback, 4)
-    pred_sc  = _model.predict(inp, verbose=0)[0]                              # skala scaled — dipakai untuk rekursi
-    pred_ori = _scaler_feat.inverse_transform(pred_sc.reshape(1, -1))[0]      # skala asli — hanya untuk laporan
+    inp = window_scaled[-lookback:].astype(np.float32).reshape(1, lookback, 4)
+
+    # TFLite inference (ganti _model.predict)
+    input_details  = _model.get_input_details()
+    output_details = _model.get_output_details()
+
+    _model.set_tensor(input_details[0]['index'], inp)
+    _model.invoke()
+    pred_sc = _model.get_tensor(output_details[0]['index'])[0]  # shape (4,)
+
+    pred_ori = _scaler_feat.inverse_transform(pred_sc.reshape(1, -1))[0]
     qos      = compute_qos_index(*pred_ori)
+
     return {
-        "scaled"           : pred_sc,                 # np.ndarray (4,), TIDAK dibulatkan — untuk geser window
+        "scaled"           : pred_sc,
         "Throughput (Mbps)": round(float(pred_ori[0]), 4),
         "Delay (ms)"       : round(float(pred_ori[1]), 4),
         "Jitter (ms)"      : round(float(pred_ori[2]), 4),
