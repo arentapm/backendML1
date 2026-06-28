@@ -1,14 +1,3 @@
-# =========================================================
-# API FASTAPI - MSSA-LSTM QoS PREDICTION
-# Input: batch List[List[float]] dari Flutter SQLite
-# Referensi: Recursive Sliding Window (arXiv:2511.11630)
-#
-# /predict_future sekarang ASYNC JOB:
-#   1. POST /predict_future       → return job_id langsung (instan)
-#   2. GET  /predict_future/{id}  → polling status & progress
-#   3. Saat status == "success"   → hasil ada di response (predictions_5m/30m)
-# =========================================================
-
 import time
 import uuid
 import traceback
@@ -24,10 +13,10 @@ from pydantic import BaseModel, field_validator
 # =========================================================
 # KONSTANTA
 # =========================================================
-MIN_ROWS   = 110   # = lookback
-N_FEATURES = 4     # Throughput, Delay, Jitter, SINR
+MIN_ROWS   = 110
+N_FEATURES = 4
 
-JOB_TTL_SECONDS = 6 * 3600   # job lama dihapus otomatis setelah 6 jam
+JOB_TTL_SECONDS = 6 * 3600
 
 # =========================================================
 # STATE
@@ -35,19 +24,8 @@ JOB_TTL_SECONDS = 6 * 3600   # job lama dihapus otomatis setelah 6 jam
 _model_ready   = False
 _model_loading = False
 
-# Job store di memori — aman karena 1 worker/proses (lihat catatan di bawah)
-# Struktur tiap job:
-# {
-#   "status"   : "queued" | "processing" | "success" | "error" | "waiting",
-#   "progress" : 0-100,
-#   "message"  : str | None,
-#   "result"   : dict | None,
-#   "created_at": float (epoch),
-# }
 _jobs: dict[str, dict] = {}
 
-# Thread pool khusus untuk kerja berat (model inference berulang).
-# Dipisah dari default executor agar tidak bentrok dengan endpoint lain.
 _executor = ThreadPoolExecutor(max_workers=2)
 
 
@@ -71,7 +49,7 @@ async def _load_model_background():
 
 
 def _cleanup_old_jobs():
-    now = time.time()
+    now     = time.time()
     expired = [
         jid for jid, j in _jobs.items()
         if now - j["created_at"] > JOB_TTL_SECONDS
@@ -81,11 +59,11 @@ def _cleanup_old_jobs():
 
 
 # =========================================================
-# LIFESPAN
+# LIFESPAN — await warmup agar server online = model ready
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(_load_model_background())
+    await _load_model_background()   # tunggu sampai model benar-benar siap
     yield
     _executor.shutdown(wait=False)
 
@@ -96,9 +74,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="MSSA-LSTM QoS API",
     description=(
-        "Recursive Sliding Window Forecasting, "
-        "setiap prediksi menjadi input "
-        "window berikutnya (replika otomatis)."
+        "Recursive Sliding Window Forecasting. "
+        "mode=5m → 300 iterasi (cepat). "
+        "mode=30m → 7200 iterasi (2 jam)."
     ),
     lifespan=lifespan,
 )
@@ -108,6 +86,7 @@ app = FastAPI(
 # =========================================================
 class QoSInput(BaseModel):
     input: list[list[float]]
+    mode: str = "30m"   # "5m" atau "30m"
 
     @field_validator("input")
     @classmethod
@@ -122,6 +101,14 @@ class QoSInput(BaseModel):
                     f"diterima {len(row)}"
                 )
         return v
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, v):
+        if v not in ("5m", "30m"):
+            raise ValueError("mode harus '5m' atau '30m'")
+        return v
+
 
 # =========================================================
 # HELPER
@@ -150,6 +137,7 @@ def _check_min_rows(n: int) -> Optional[JSONResponse]:
         )
     return None
 
+
 # =========================================================
 # ROOT & STATUS
 # =========================================================
@@ -170,12 +158,12 @@ async def status():
         "model_loading": _model_loading,
     }
 
+
 # =========================================================
-# /predict — 1 prediksi dari window terakhir (real-time, tetap sinkron)
+# /predict — 1 prediksi real-time
 # =========================================================
 @app.post("/predict")
 async def predict(data: QoSInput):
-
     err = _check_model()
     if err: return err
 
@@ -185,12 +173,8 @@ async def predict(data: QoSInput):
     try:
         from pipeline import predict_current
 
-        result = await asyncio.to_thread(
-            predict_current,
-            data.input,
-        )
-
-        pred = result["current_prediction"]
+        result = await asyncio.to_thread(predict_current, data.input)
+        pred   = result["current_prediction"]
 
         return {
             "status": "success",
@@ -220,10 +204,11 @@ async def predict(data: QoSInput):
             }
         )
 
+
 # =========================================================
-# WORKER — dijalankan di thread terpisah, update _jobs[job_id]
+# WORKER — dijalankan di thread terpisah
 # =========================================================
-def _run_predict_future_job(job_id: str, input_data: list[list[float]]):
+def _run_predict_future_job(job_id: str, input_data: list[list[float]], mode: str):
     from pipeline import predict_future as run_future
 
     def on_progress(done: int, total: int):
@@ -233,41 +218,30 @@ def _run_predict_future_job(job_id: str, input_data: list[list[float]]):
     try:
         _jobs[job_id]["status"] = "processing"
 
-        result = run_future(input_data, progress_callback=on_progress)
+        result = run_future(input_data, mode=mode, progress_callback=on_progress)
 
         _jobs[job_id].update({
             "status"  : "success",
             "progress": 100,
             "result"  : {
-                "predictions_5m_detail": result["predictions_5m_detail"], 
-                "predictions_30m": result["predictions_30m"],
+                "predictions_5m_detail": result["predictions_5m_detail"],
+                "predictions_30m"      : result["predictions_30m"],
             },
             "message": None,
         })
 
     except ValueError as e:
-        _jobs[job_id].update({
-            "status" : "error",
-            "message": str(e),
-        })
+        _jobs[job_id].update({"status": "error", "message": str(e)})
     except Exception as e:
         traceback.print_exc()
-        _jobs[job_id].update({
-            "status" : "error",
-            "message": str(e),
-        })
+        _jobs[job_id].update({"status": "error", "message": str(e)})
 
 
 # =========================================================
-# /predict_future — START JOB (instan, tidak menunggu)
-#
-# Response:
-#   {"status": "queued", "job_id": "..."}
-# Flutter lalu polling GET /predict_future/{job_id}
+# /predict_future — START JOB
 # =========================================================
 @app.post("/predict_future")
 async def predict_future_start(data: QoSInput):
-
     err = _check_model()
     if err: return err
 
@@ -282,31 +256,29 @@ async def predict_future_start(data: QoSInput):
         "progress"  : 0,
         "message"   : None,
         "result"    : None,
+        "mode"      : data.mode,
         "created_at": time.time(),
     }
 
     loop = asyncio.get_running_loop()
-    # Lempar kerja berat ke thread pool — tidak diawait, supaya endpoint
-    # langsung return job_id ke client.
-    loop.run_in_executor(_executor, _run_predict_future_job, job_id, data.input)
+    loop.run_in_executor(
+        _executor,
+        _run_predict_future_job,
+        job_id,
+        data.input,
+        data.mode,
+    )
 
     return {
-        "status": "queued",
-        "job_id": job_id,
-        "message": "Forecast sedang diproses, gunakan job_id untuk polling",
+        "status" : "queued",
+        "job_id" : job_id,
+        "mode"   : data.mode,
+        "message": f"Forecast mode={data.mode} sedang diproses, gunakan job_id untuk polling",
     }
 
 
 # =========================================================
 # /predict_future/{job_id} — POLLING STATUS
-#
-# Response saat masih proses:
-#   {"status": "processing", "progress": 42.5}
-# Response saat sukses:
-#   {"status": "success", "progress": 100,
-#    "predictions_5m": [...], "predictions_30m": [...]}
-# Response saat gagal:
-#   {"status": "error", "message": "..."}
 # =========================================================
 @app.get("/predict_future/{job_id}")
 async def predict_future_status(job_id: str):
@@ -320,11 +292,12 @@ async def predict_future_status(job_id: str):
 
     if job["status"] == "success":
         return {
-            "status"          : "success",
-            "progress"        : 100,
-            "model"           : "MSSA-LSTM",
+            "status"               : "success",
+            "progress"             : 100,
+            "model"                : "MSSA-LSTM",
+            "mode"                 : job.get("mode", "30m"),
             "predictions_5m_detail": job["result"]["predictions_5m_detail"],
-            "predictions_30m" : job["result"]["predictions_30m"],
+            "predictions_30m"      : job["result"]["predictions_30m"],
         }
 
     if job["status"] == "error":
@@ -337,6 +310,7 @@ async def predict_future_status(job_id: str):
     return {
         "status"  : job["status"],
         "progress": job["progress"],
+        "mode"    : job.get("mode", "30m"),
     }
 
 
@@ -345,9 +319,4 @@ async def predict_future_status(job_id: str):
 # =========================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "api:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
-    )
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
