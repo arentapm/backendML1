@@ -5,7 +5,7 @@ import pandas as pd
 from collections import deque
 from pathlib import Path
 from scipy.linalg import svd
-import tensorflow as tf
+from tensorflow.keras.models import load_model
 from typing import Callable, Optional
 
 # =========================================================
@@ -18,10 +18,11 @@ PREDICT_INTERVAL      = 1
 MIN_DATA_TO_PRED      = 110    # = lookback
 DATA_INTERVAL_SECONDS = 1
 
-INTERVAL_5M_SEC    = 5  * 60       # 300 detik
-INTERVAL_30M_SEC   = 30 * 60       # 1800 detik
-TAMPILAN_5M_DETAIL = 300           # semua step t+1..t+300 untuk grafik
-TAMPILAN_30M       = (2 * 60) // 30  # 4 titik (t+30m, t+60m, t+90m, t+120m)
+INTERVAL_5M_SEC  = 5  * 60                      # 300 detik
+INTERVAL_30M_SEC = 30 * 60                      # 1800 detik
+TAMPILAN_5M      = 1                            # 1 titik final (t+300)
+TAMPILAN_5M_DETAIL = 300                        # semua step t+1..t+300 untuk grafik
+TAMPILAN_30M     = (2 * 60) // 30              # 24 titik
 
 # =========================================================
 # ARTIFACTS
@@ -36,26 +37,13 @@ _last_result = None
 
 def warmup():
     global _model, _scaler_feat, _config
-
-    interpreter = tf.lite.Interpreter(
-        model_path=str(MODELS_DIR / "model_qos_dengan_MSSA.tflite")
-    )
-    interpreter.allocate_tensors()  # cukup sekali di sini
-    _model = interpreter
-
+    _model       = load_model(MODELS_DIR / "model_qos_dengan_MSSA.keras")
     _scaler_feat = joblib.load(MODELS_DIR / "scaler_feat.pkl")
     with open(MODELS_DIR / "config.json") as f:
         _config = json.load(f)
-
-    # Debug shape — hapus setelah konfirmasi OK
-    input_details = _model.get_input_details()
     print(
-        f"[Backend] TFLite loaded | "
-        f"input shape: {input_details[0]['shape']} | "
-        f"dtype: {input_details[0]['dtype']}"
-    )
-    print(
-        f"[Backend] lookback={_config['lookback']} | "
+        f"[Backend] Model loaded | "
+        f"lookback={_config['lookback']} | "
         f"L_MSSA={_config['L_MSSA']}"
     )
 
@@ -165,20 +153,11 @@ def _predict_one_window(window_scaled: np.ndarray) -> dict:
     """
     lookback = _config["lookback"]
     inp      = window_scaled[-lookback:].astype(np.float32).reshape(1, lookback, 4)
-
-    input_details  = _model.get_input_details()
-    output_details = _model.get_output_details()
-
-    # allocate_tensors() sudah dipanggil di warmup(), tidak perlu dipanggil lagi di sini
-    _model.set_tensor(input_details[0]['index'], inp)
-    _model.invoke()
-    pred_sc = _model.get_tensor(output_details[0]['index'])[0]  # shape (4,)
-
-    pred_ori = _scaler_feat.inverse_transform(pred_sc.reshape(1, -1))[0]
+    pred_sc  = _model.predict(inp, verbose=0)[0]                              # skala scaled — dipakai untuk rekursi
+    pred_ori = _scaler_feat.inverse_transform(pred_sc.reshape(1, -1))[0]      # skala asli — hanya untuk laporan
     qos      = compute_qos_index(*pred_ori)
-
     return {
-        "scaled"           : pred_sc,                         # untuk rekursi sliding window
+        "scaled"           : pred_sc,                 # np.ndarray (4,), TIDAK dibulatkan — untuk geser window
         "Throughput (Mbps)": round(float(pred_ori[0]), 4),
         "Delay (ms)"       : round(float(pred_ori[1]), 4),
         "Jitter (ms)"      : round(float(pred_ori[2]), 4),
@@ -222,11 +201,11 @@ def predict_current(raw_input: list[list[float]]) -> dict:
 # PREDICT FUTURE — Recursive Sliding Window
 #
 # Input  : minimal `lookback` (110) baris data nyata, dipakai 110 terakhir
-# Loop   : berjalan sampai step target terbesar (7200 untuk 2 jam)
+# Loop   : berjalan sampai step target terbesar (43.200 untuk 12 jam @5 menit)
 #
 # Hasil diambil dari:
-#   - Setiap step ke-1..300         → grafik detail 5 menit (300 titik)
-#   - Setiap step ke-1800,3600,5400,7200 → tampilan per 30 menit (4 titik)
+#   - Setiap step ke-300, 600, ..., 43200  → tampilan per 5 menit  (144 titik)
+#   - Setiap step ke-1800, 3600, ..., 43200 → tampilan per 30 menit (24 titik)
 #
 # progress_callback(done_steps, total_steps) dipanggil secara berkala
 # agar caller (api.py) bisa update progress job ke client.
@@ -253,11 +232,11 @@ def predict_future(
 
     window = reconstructed.copy()
 
-    # Target: semua step 1..300 (grafik 5m) + step 1800,3600,5400,7200 (30m, 4 titik)
-    targets_5m_detail = set(range(1, INTERVAL_5M_SEC + 1))                       # 1..300
-    targets_30m       = {(i + 1) * INTERVAL_30M_SEC for i in range(TAMPILAN_30M)} # 1800,3600,5400,7200
+    # Target: semua step 1..300 (grafik 5m) + step 1800,3600,...,43200 (30m)
+    targets_5m_detail = set(range(1, INTERVAL_5M_SEC + 1))
+    targets_30m       = {(i + 1) * INTERVAL_30M_SEC for i in range(TAMPILAN_30M)}
     all_targets       = sorted(targets_5m_detail | targets_30m)
-    max_step          = all_targets[-1]  # 7200
+    max_step          = all_targets[-1]  # 43200
 
     results_at: dict[int, dict] = {}
     next_target_idx = 0
@@ -281,13 +260,13 @@ def predict_future(
         for step in range(1, INTERVAL_5M_SEC + 1)
     ]
 
-    # Output 30m: t+30m, t+60m, t+90m, t+120m (4 titik)
+    # Output 30m: t+30m .. t+120m (24 titik)
     predictions_30m = []
     for i in range(TAMPILAN_30M):
-        s = (i + 1) * INTERVAL_30M_SEC
-        p = results_at[s]
+        s   = (i + 1) * INTERVAL_30M_SEC
+        p   = results_at[s]
         predictions_30m.append({
-            "label"            : f"t+{(i + 1) * 30}m",
+            "label"            : f"t+{(i+1)*30}m",
             "Throughput (Mbps)": p["Throughput (Mbps)"],
             "Delay (ms)"       : p["Delay (ms)"],
             "Jitter (ms)"      : p["Jitter (ms)"],
