@@ -37,7 +37,7 @@ _last_result = None
 
 def warmup():
     global _model, _scaler_feat, _config
-    _model       = load_model(MODELS_DIR / "model_qos_dengan_MSSA.keras")
+    _model = load_model(MODELS_DIR / "model_qos_dengan_MSSA.keras") 
     _scaler_feat = joblib.load(MODELS_DIR / "scaler_feat.pkl")
     with open(MODELS_DIR / "config.json") as f:
         _config = json.load(f)
